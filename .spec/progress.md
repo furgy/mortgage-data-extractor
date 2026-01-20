@@ -10,6 +10,12 @@
 -   [x] Git repository initialization and remote push.
 -   [x] OpenSpec documentation implementation.
 
+## In Progress
+-   [ ] **Phase 2: Reconciliation Engine Architecture**
+    -   [ ] Create Python data models for `StessaTransaction` and `StatementTransaction`.
+    -   [ ] Implement fuzzy matching logic (Date/Amount/Payee).
+    -   [ ] Build automated audit report (PDF/Markdown).
+
 ## Future Plans
 -   [ ] Automated PDF downloading via browser automation.
 -   [ ] Support for additional mortgage providers.

@@ -1,10 +1,11 @@
 # System Role
 
 ## Core Responsibilities
--   **PDF Extraction**: Parse mortgage statements from Huntington and PNC banks using regex patterns and OCR-less PDF text extraction.
--   **Data Organization**: Move processed statements to a logical directory structure (`processed_statements/YYYY/Property/`) and maintain a `downloads.json` registry.
--   **Stessa Export**: Generate CSV files matching Stessa's import template, specifically splitting single payments into Principal, Interest, and Escrow lines.
--   **Property Boss Mapping**: Map property manager GL accounts to Stessa categories and normalize building names to Stessa property names.
+-   **PDF/CSV Extraction**: Parse mortgage statements and property management reports (Property Boss).
+-   **Data Normalization**: Standardize disparate inputs (dates, signs, payees) into a unified internal model.
+-   **Automated Audit**: Reconcile external statements against the **Stessa Source of Truth**.
+-   **Discrepancy Reporting**: Identify and flag missing transactions, amount mismatches, or incorrect categorizations.
+-   **Stessa Export**: Facilitate clean data entry for non-integrated sources through template-compliant CSV generation.
 
 ## Key Features
 -   **Modular Extractors**: Separate classes for different bank formats (`HuntingtonExtractor`, `PNCExtractor`).
