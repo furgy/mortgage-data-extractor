@@ -6,6 +6,7 @@
 
 ## Libraries
 -   **pypdf**: For extracting text from mortgage PDF statements.
+-   **SQLAlchemy**: Python SQL Toolkit and ORM for database interaction.
 -   **csv**: Standard library for processing Property Boss and Stessa files.
 -   **datetime**: For sorting and date manipulation.
 -   **re**: For pattern-based data extraction.

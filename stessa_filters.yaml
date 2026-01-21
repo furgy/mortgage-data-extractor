@@ -1,0 +1,15 @@
+# Stessa Transaction Filtering Rules
+# Transactions matching any of these criteria will be excluded from reconciliation.
+
+filters:
+  - category: "Transfers"
+    action: "EXCLUDE"
+    reason: "Transfer transaction"
+  
+  - sub_category: "Transfers"
+    action: "EXCLUDE"
+    reason: "Transfer transaction"
+  
+  - name: "Transfer"
+    action: "EXCLUDE"
+    reason: "Transfer in name"

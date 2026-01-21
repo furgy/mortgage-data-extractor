@@ -1,0 +1,17 @@
+# Property Boss Transaction Filtering Rules
+# Transactions matching any of these criteria will be excluded from reconciliation.
+
+filters:
+  - glAccountName: "Owner Distribution"
+    action: "EXCLUDE"
+  
+  - entryDate: "1/1/2025"
+    payeeName: ""
+    action: "EXCLUDE"
+    reason: "Opening Balance"
+
+  - payeeName: "Shawn Furgason"
+    action: "EXCLUDE"
+
+  - amount: 0.0
+    action: "EXCLUDE"
