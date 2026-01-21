@@ -438,8 +438,8 @@ if __name__ == "__main__":
     engine, Session = init_db()
     session = Session()
     
-    stessa_file = 'stessa_import_format.csv'
-    pb_file = 'Property_Boss_Transactions-2025.csv'
+    stessa_file = 'inputs/stessa_import_format.csv'
+    pb_file = 'inputs/Property_Boss_Transactions-2025.csv'
     
     # Seed properties from Stessa (if new ones exist)
     if os.path.exists(stessa_file):

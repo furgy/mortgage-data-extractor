@@ -57,13 +57,13 @@ def run_reconciliation(year=None):
     print("Reloading Stessa and Property Boss data...")
     from database_manager import seed_properties_from_stessa, load_stessa_csv, load_property_boss_csv, load_mortgage_statements, load_costar_csv
     
-    stessa_file = 'stessa_import_format.csv'
+    stessa_file = 'inputs/stessa_import_format.csv'
     if os.path.exists(stessa_file):
         seed_properties_from_stessa(session, stessa_file)
         load_stessa_csv(session, stessa_file)
     
-    if os.path.exists('Property_Boss_Transactions-2025.csv'):
-        load_property_boss_csv(session, 'Property_Boss_Transactions-2025.csv')
+    if os.path.exists('inputs/Property_Boss_Transactions-2025.csv'):
+        load_property_boss_csv(session, 'inputs/Property_Boss_Transactions-2025.csv')
         
     # We should also reload mortgage statements to ensure linking happens
     # But that might be slow if there are many PDFs. 
@@ -75,8 +75,8 @@ def run_reconciliation(year=None):
         load_mortgage_statements(session, 'statements')
     
     # Load Costar rent payments if available
-    if os.path.exists('costar-payment-data.csv'):
-        load_costar_csv(session, 'costar-payment-data.csv')
+    if os.path.exists('inputs/costar-payment-data.csv'):
+        load_costar_csv(session, 'inputs/costar-payment-data.csv')
 
     # Clear previous matches
     session.query(ReconciliationMatch).delete()
