@@ -13,3 +13,28 @@ filters:
   - name: "Transfer"
     action: "EXCLUDE"
     reason: "Transfer in name"
+  
+  - sub_category: "Misc Interest"
+    action: "EXCLUDE"
+    reason: "Misc Interest transaction"
+  
+  - name: "Misc Interest"
+    action: "EXCLUDE"
+    reason: "Misc Interest in name"
+  
+  - sub_category: "Stessa Interest"
+    action: "EXCLUDE"
+    reason: "Stessa Interest transaction"
+  
+  - category: "Admin & Other"
+    property: ""
+    action: "EXCLUDE"
+    reason: "Admin & Other transaction without property"
+  
+  - category: "Security Deposits"
+    action: "EXCLUDE"
+    reason: "Security deposit transaction"
+  
+  - sub_category: "Security Deposits"
+    action: "EXCLUDE"
+    reason: "Security deposit transaction"

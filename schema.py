@@ -107,8 +107,12 @@ class ReconciliationMatch(Base):
     pb_id = Column(Integer, ForeignKey('property_boss_raw.id'))
     mortgage_id = Column(Integer, ForeignKey('mortgage_raw.id'))
     costar_id = Column(Integer, ForeignKey('costar_raw.id'))
+    realty_medics_id = Column(Integer, ForeignKey('realty_medics_raw.id'))
+    renshaw_id = Column(Integer, ForeignKey('renshaw_raw.id'))
+    allstar_id = Column(Integer, ForeignKey('allstar_raw.id'))
+    mike_mikes_id = Column(Integer, ForeignKey('mike_mikes_raw.id'))
     match_score = Column(Float) # 1.0 for exact, less for fuzzy
-    match_type = Column(String) # 'exact', 'fuzzy', 'date_offset', 'mortgage_component', 'costar_rent'
+    match_type = Column(String) # 'exact', 'fuzzy', 'date_offset', 'mortgage_component', 'costar_rent', 'realty_medics', 'renshaw', 'allstar', 'mike_mikes'
     notes = Column(String)
 
 class CostarRaw(Base):
@@ -155,6 +159,73 @@ class MortgageRaw(Base):
     validation_error = Column(String)
     raw_text_record = Column(String)
 
+class RealtyMedicsRaw(Base):
+    """
+    Stores extracted data from Realty Medics property management CSV reports.
+    """
+    __tablename__ = 'realty_medics_raw'
+
+    id = Column(Integer, primary_key=True)
+    property_id = Column(Integer, ForeignKey('properties.id')) # Link to master property
+    account_name = Column(String)
+    transaction_type = Column(String) # "Income" or "Expense"
+    transaction_date = Column(String) # Date in YYYY-MM-DD format
+    month = Column(String) # e.g., "Jan 2025", "Feb 2025"
+    amount = Column(Float) # Positive for income, negative for expenses
+    stessa_category = Column(String)
+    stessa_sub_category = Column(String)
+
+class RenshawRaw(Base):
+    """
+    Stores extracted data from Renshaw property management HTML reports.
+    """
+    __tablename__ = 'renshaw_raw'
+
+    id = Column(Integer, primary_key=True)
+    property_id = Column(Integer, ForeignKey('properties.id')) # Link to master property
+    account_name = Column(String)
+    account_code = Column(String)
+    transaction_type = Column(String) # "Income" or "Expense"
+    transaction_date = Column(String) # Date in YYYY-MM-DD format
+    month = Column(String) # e.g., "JAN 25", "FEB 25"
+    amount = Column(Float) # Positive for income, negative for expenses
+    stessa_category = Column(String)
+    stessa_sub_category = Column(String)
+
+class AllstarRaw(Base):
+    """
+    Stores extracted data from Allstar property management CSV reports.
+    """
+    __tablename__ = 'allstar_raw'
+
+    id = Column(Integer, primary_key=True)
+    property_id = Column(Integer, ForeignKey('properties.id')) # Link to master property
+    account_name = Column(String)
+    transaction_type = Column(String) # "Income" or "Expense"
+    transaction_date = Column(String) # Date in YYYY-MM-DD format
+    month = Column(String) # e.g., "Jan 2025", "Feb 2025"
+    amount = Column(Float) # Positive for income, negative for expenses
+    stessa_category = Column(String)
+    stessa_sub_category = Column(String)
+
+class MikeMikesRaw(Base):
+    """
+    Stores extracted data from Mike & Mikes property management PDF statements.
+    """
+    __tablename__ = 'mike_mikes_raw'
+
+    id = Column(Integer, primary_key=True)
+    property_id = Column(Integer, ForeignKey('properties.id')) # Link to master property
+    statement_date = Column(String) # Statement date
+    statement_start = Column(String) # Statement period start
+    statement_end = Column(String) # Statement period end
+    description = Column(String) # Transaction description
+    transaction_date = Column(String) # Date in YYYY-MM-DD format
+    amount = Column(Float) # Positive for income, negative for expenses
+    transaction_type = Column(String) # "Income" or "Expense"
+    stessa_category = Column(String)
+    stessa_sub_category = Column(String)
+
 def init_db(db_path='reconciliation.db'):
     engine = create_engine(f'sqlite:///{db_path}')
     Base.metadata.create_all(engine)
@@ -200,13 +271,46 @@ def init_db(db_path='reconciliation.db'):
         )
         table_sql = result.fetchone()
         
-        if table_sql and table_sql[0] and 'costar_id' not in table_sql[0]:
-            print("Migrating database: Adding costar_id column to reconciliation_matches table...")
-            conn.execute(
-                text("ALTER TABLE reconciliation_matches ADD COLUMN costar_id INTEGER REFERENCES costar_raw(id)")
-            )
-            conn.commit()
-            print("Migration complete: costar_id column added to reconciliation_matches")
+        if table_sql and table_sql[0]:
+            if 'costar_id' not in table_sql[0]:
+                print("Migrating database: Adding costar_id column to reconciliation_matches table...")
+                conn.execute(
+                    text("ALTER TABLE reconciliation_matches ADD COLUMN costar_id INTEGER REFERENCES costar_raw(id)")
+                )
+                conn.commit()
+                print("Migration complete: costar_id column added to reconciliation_matches")
+            
+            if 'realty_medics_id' not in table_sql[0]:
+                print("Migrating database: Adding realty_medics_id column to reconciliation_matches table...")
+                conn.execute(
+                    text("ALTER TABLE reconciliation_matches ADD COLUMN realty_medics_id INTEGER REFERENCES realty_medics_raw(id)")
+                )
+                conn.commit()
+                print("Migration complete: realty_medics_id column added to reconciliation_matches")
+            
+            if 'renshaw_id' not in table_sql[0]:
+                print("Migrating database: Adding renshaw_id column to reconciliation_matches table...")
+                conn.execute(
+                    text("ALTER TABLE reconciliation_matches ADD COLUMN renshaw_id INTEGER REFERENCES renshaw_raw(id)")
+                )
+                conn.commit()
+                print("Migration complete: renshaw_id column added to reconciliation_matches")
+            
+            if 'allstar_id' not in table_sql[0]:
+                print("Migrating database: Adding allstar_id column to reconciliation_matches table...")
+                conn.execute(
+                    text("ALTER TABLE reconciliation_matches ADD COLUMN allstar_id INTEGER REFERENCES allstar_raw(id)")
+                )
+                conn.commit()
+                print("Migration complete: allstar_id column added to reconciliation_matches")
+            
+            if 'mike_mikes_id' not in table_sql[0]:
+                print("Migrating database: Adding mike_mikes_id column to reconciliation_matches table...")
+                conn.execute(
+                    text("ALTER TABLE reconciliation_matches ADD COLUMN mike_mikes_id INTEGER REFERENCES mike_mikes_raw(id)")
+                )
+                conn.commit()
+                print("Migration complete: mike_mikes_id column added to reconciliation_matches")
     
     return engine, sessionmaker(bind=engine)
 

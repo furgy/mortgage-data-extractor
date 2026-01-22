@@ -1,10 +1,33 @@
 import datetime
 import os
 import argparse
-from schema import init_db, StessaRaw, PropertyBossRaw, MortgageRaw, ReconciliationMatch, Property, CostarRaw
+from itertools import combinations
+from schema import init_db, StessaRaw, PropertyBossRaw, MortgageRaw, ReconciliationMatch, Property, CostarRaw, RealtyMedicsRaw, RenshawRaw, AllstarRaw, MikeMikesRaw
 import re
 
 # ... (rest of imports/functions)
+
+def matches_management_fee_subcategory(stessa_sub_category, source_sub_category):
+    """
+    Standardized function to check if sub-categories match for Management Fees.
+    Management Fees can have sub-categories like "Property Management" or "Leasing Commissions".
+    Returns True if sub-categories match, False otherwise.
+    
+    Rules:
+    - If either is empty, consider it a match (empty means default/unspecified Property Management)
+    - If both have values, they must match exactly (case-insensitive)
+    - "Property Management" matches "Property Management"
+    - "Leasing Commissions" matches "Leasing Commissions"
+    """
+    stessa_sub = (stessa_sub_category or '').strip().lower()
+    source_sub = (source_sub_category or '').strip().lower()
+    
+    # If either is empty, consider it a match (empty = default Property Management)
+    if not stessa_sub or not source_sub:
+        return True
+    
+    # Both have values - must match exactly
+    return stessa_sub == source_sub
 
 def parse_date(date_str):
     if not date_str:
@@ -44,7 +67,7 @@ def filter_by_year(records, date_field, year):
     return filtered
 
 
-def run_reconciliation(year=None):
+def run_reconciliation(year=None, clear_manual=False):
     engine, Session = init_db()
     session = Session()
     
@@ -55,7 +78,7 @@ def run_reconciliation(year=None):
     # Or just assume DB is fresh from valid previous step. 
     # Let's re-run loaders to be safe as per previous pattern.
     print("Reloading Stessa and Property Boss data...")
-    from database_manager import seed_properties_from_stessa, load_stessa_csv, load_property_boss_csv, load_mortgage_statements, load_costar_csv
+    from database_manager import seed_properties_from_stessa, load_stessa_csv, load_property_boss_csv, load_mortgage_statements, load_costar_csv, load_realty_medics_csv, load_renshaw_html, load_allstar_csv, load_mike_mikes_statements
     
     stessa_file = 'inputs/stessa_import_format.csv'
     if os.path.exists(stessa_file):
@@ -77,29 +100,85 @@ def run_reconciliation(year=None):
     # Load Costar rent payments if available
     if os.path.exists('inputs/costar-payment-data.csv'):
         load_costar_csv(session, 'inputs/costar-payment-data.csv')
+    
+    # Load Realty Medics income/expense reports if available
+    # Clear existing Realty Medics data first to avoid duplicates
+    session.query(RealtyMedicsRaw).delete()
+    session.commit()
+    
+    # Try individual property files first, then fall back to combined report
+    marion_oaks_file = 'inputs/marion_oaks-2025.csv'
+    sw38th_file = 'inputs/sw_38th-2025.csv'
+    combined_file = 'inputs/realty_medics_2025.csv'
+    
+    if os.path.exists(marion_oaks_file):
+        load_realty_medics_csv(session, marion_oaks_file, property_name='Marion Oaks')
+    if os.path.exists(sw38th_file):
+        load_realty_medics_csv(session, sw38th_file, property_name='38th')
+    # Only load combined file if individual files don't exist
+    if not os.path.exists(marion_oaks_file) and not os.path.exists(sw38th_file) and os.path.exists(combined_file):
+        load_realty_medics_csv(session, combined_file)
+    
+    # Load Renshaw HTML report if available
+    renshaw_file = 'inputs/Renshaw-Income- 2025.html'
+    if os.path.exists(renshaw_file):
+        load_renshaw_html(session, renshaw_file, property_name='Lone Rock')
+    
+    # Load Allstar CSV report if available
+    allstar_file = 'inputs/allstar_2025.csv'
+    if os.path.exists(allstar_file):
+        load_allstar_csv(session, allstar_file, property_name='Malacca')
+    
+    # Load Mike & Mikes PDF statements if available
+    mike_mikes_dir = 'inputs/mike_mikes'
+    if os.path.exists(mike_mikes_dir):
+        load_mike_mikes_statements(session, mike_mikes_dir)
 
-    # Clear previous matches
-    session.query(ReconciliationMatch).delete()
+    # Clear previous matches (but preserve manual reconciliations unless explicitly cleared)
+    if clear_manual:
+        session.query(ReconciliationMatch).delete()
+    else:
+        session.query(ReconciliationMatch).filter(
+            ReconciliationMatch.match_type != 'manual_reconciled'
+        ).delete()
     
     # Query all records (exclude filtered transactions)
-    stessa_txs = session.query(StessaRaw).filter(StessaRaw.is_filtered == False).all()
+    # Get Stessa transactions, but include "Transfers/Owner Distributions" even if filtered
+    # (Owner distributions from property managers should be reconciled)
+    stessa_txs = session.query(StessaRaw).filter(
+        (StessaRaw.is_filtered == False) |
+        ((StessaRaw.category == 'Transfers') & (StessaRaw.sub_category == 'Owner Distributions'))
+    ).all()
     pb_txs = session.query(PropertyBossRaw).filter(PropertyBossRaw.is_filtered == False).all()
     mortgage_stmts = session.query(MortgageRaw).all()
     costar_txs = session.query(CostarRaw).all()
+    realty_medics_txs = session.query(RealtyMedicsRaw).all()
+    renshaw_txs = session.query(RenshawRaw).all()
+    allstar_txs = session.query(AllstarRaw).all()
+    mike_mikes_txs = session.query(MikeMikesRaw).all()
     
     # Filter by year if specified
     if year:
         stessa_txs = filter_by_year(stessa_txs, 'date', year)
         pb_txs = filter_by_year(pb_txs, 'entryDate', year)
-        mortgage_stmts = filter_by_year(mortgage_stmts, 'statement_date', year)
+        # For mortgage statements, filter by payment_due_date (with fallback to statement_date)
+        # This includes statements issued in Dec 2024 with payment due dates in Jan 2025
+        mortgage_stmts = [m for m in mortgage_stmts if (
+            (parse_date(m.payment_due_date) and parse_date(m.payment_due_date).year == year) or
+            (not m.payment_due_date and parse_date(m.statement_date) and parse_date(m.statement_date).year == year)
+        )]
         costar_txs = filter_by_year(costar_txs, 'completed_on', year)
+        realty_medics_txs = filter_by_year(realty_medics_txs, 'transaction_date', year)
+        renshaw_txs = filter_by_year(renshaw_txs, 'transaction_date', year)
+        allstar_txs = filter_by_year(allstar_txs, 'transaction_date', year)
+        mike_mikes_txs = filter_by_year(mike_mikes_txs, 'transaction_date', year)
         print(f"Filtering reconciliation to year {year}...")
     
     # Sort statements by date
     mortgage_stmts.sort(key=lambda x: parse_date(x.statement_date) or datetime.date.min)
     
     year_label = f" for {year}" if year else ""
-    print(f"Starting reconciliation{year_label}: {len(stessa_txs)} Stessa, {len(pb_txs)} PB, {len(mortgage_stmts)} Mortgage, {len(costar_txs)} Apartments.com...")
+    print(f"Starting reconciliation{year_label}: {len(stessa_txs)} Stessa, {len(pb_txs)} PB, {len(mortgage_stmts)} Mortgage, {len(costar_txs)} Apartments.com, {len(realty_medics_txs)} Realty Medics, {len(renshaw_txs)} Renshaw, {len(allstar_txs)} Allstar, {len(mike_mikes_txs)} Mike & Mikes...")
     
     matched_stessa_ids = set()
     matched_pb_ids = set()
@@ -112,8 +191,8 @@ def run_reconciliation(year=None):
     # Or just filter in loop. Loop is fine for dataset size.
     
     for pass_num in [1, 2]:
-        tolerance = 15 if pass_num == 1 else 35
-        print(f"  Pass {pass_num} (Tolerance: {tolerance}d)...")
+        tolerance = 10 if pass_num == 1 else 15
+        print(f"  Pass {pass_num} (Tolerance: {tolerance}d after due date)...")
         
         for m_stmt in mortgage_stmts:
             if not m_stmt.property_id:
@@ -150,14 +229,26 @@ def run_reconciliation(year=None):
                     if s_tx.id in matched_stessa_ids: continue
                     
                     # Category Filter
-                    if comp_name == 'Principal' and s_tx.sub_category != 'Mortgage Principal': continue
-                    if comp_name == 'Interest' and s_tx.sub_category != 'Mortgage Interest': continue
-                    if comp_name == 'Escrow' and s_tx.sub_category != 'General Escrow Payments': continue
+                    # If sub_category is empty, allow matching to any component (match by amount)
+                    # Otherwise, require exact sub-category match
+                    s_sub_cat = (s_tx.sub_category or '').strip()
+                    if s_sub_cat:
+                        # Has sub-category - must match exactly
+                        if comp_name == 'Principal' and s_sub_cat != 'Mortgage Principal': continue
+                        if comp_name == 'Interest' and s_sub_cat != 'Mortgage Interest': continue
+                        if comp_name == 'Escrow' and s_sub_cat != 'General Escrow Payments': continue
+                    # If sub_category is empty, we'll match by amount below
                     
                     s_date = parse_date(s_tx.date)
                     if not s_date: continue
                     
-                    date_diff = abs((s_date - m_date).days)
+                    # CRITICAL: Transaction must be ON or AFTER payment due date
+                    # Transactions before the due date are for previous statement periods
+                    if s_date < m_date:
+                        continue  # Skip transactions before payment due date
+                    
+                    # Calculate days AFTER payment due date (not absolute difference)
+                    date_diff = (s_date - m_date).days
                     if date_diff > tolerance: continue
                     
                     # Check amount match
@@ -268,7 +359,8 @@ def run_reconciliation(year=None):
             elif 'Escrow' in match.notes:
                 matched_components.add('Escrow')
         
-        # If we don't have all three components matched, check for unsplit payment
+        # Only check for unsplit payment if we don't have all three components matched
+        # Individual component matches take priority
         if len(matched_components) < 3 and m_stmt.amount_due:
             # Use payment_due_date for matching (transactions occur on/around payment due date)
             m_date = parse_date(m_stmt.payment_due_date) or parse_date(m_stmt.statement_date)
@@ -280,6 +372,10 @@ def run_reconciliation(year=None):
                 StessaRaw.property_id == m_stmt.property_id
             ).all()
             
+            best_match = None
+            best_date_diff = 999
+            best_amount_diff = 999
+            
             for s_tx in candidates:
                 if s_tx.id in matched_stessa_ids:
                     continue
@@ -289,19 +385,35 @@ def run_reconciliation(year=None):
                     continue
                 
                 s_date = parse_date(s_tx.date)
-                if s_date:
-                    date_diff = abs((s_date - m_date).days)
-                    # Check if amount matches total mortgage payment (within tolerance)
-                    # Stessa amounts are negative, so we compare with negative total
-                    if date_diff <= 35 and abs(s_tx.amount + total_amount) < 0.01:
-                        # Found an unsplit mortgage payment
-                        unsplit_mortgages.append({
-                            'mortgage': m_stmt,
-                            'stessa_tx': s_tx,
-                            'date_diff': date_diff,
-                            'matched_components': matched_components
-                        })
-                        break  # Only flag once per mortgage statement
+                if not s_date:
+                    continue
+                
+                date_diff = abs((s_date - m_date).days)
+                # Use 10-day tolerance for unsplit payments (not 30 days)
+                if date_diff > 10:
+                    continue
+                
+                # Check if amount matches total mortgage payment
+                # Stessa amounts are negative, so we compare with negative total
+                amount_diff = abs(s_tx.amount + total_amount)
+                # Allow up to $3 tolerance for unsplit payments (fat-finger errors)
+                if amount_diff <= 3.00:
+                    # Found a potential unsplit mortgage payment
+                    # Keep the best match (closest date, then closest amount)
+                    if date_diff < best_date_diff or (date_diff == best_date_diff and amount_diff < best_amount_diff):
+                        best_match = s_tx
+                        best_date_diff = date_diff
+                        best_amount_diff = amount_diff
+            
+            if best_match:
+                # Found an unsplit mortgage payment
+                unsplit_mortgages.append({
+                    'mortgage': m_stmt,
+                    'stessa_tx': best_match,
+                    'matched_components': matched_components,
+                    'date_diff': best_date_diff,
+                    'amount_diff': best_amount_diff
+                })
     
     # --- PHASE 3: Apartments.com Rent Payment Matching ---
     print("PHASE 3: Matching Apartments.com rent payments with Stessa income...")
@@ -370,12 +482,1029 @@ def run_reconciliation(year=None):
             matched_costar_ids.add(costar_tx.id)
             matches_count += 1
     
+    # --- PHASE 4: Realty Medics Transaction Matching ---
+    print("PHASE 4: Matching Realty Medics transactions with Stessa...")
+    matched_realty_medics_ids = set()
+    
+    # Get the two properties for Realty Medics (Marion Oaks and SW 38th Cir)
+    marion_oaks_prop = session.query(Property).filter(Property.stessa_name.ilike('%marion%oaks%')).first()
+    sw38th_prop = session.query(Property).filter(Property.stessa_name.ilike('%38th%')).first()
+    realty_medics_properties = [p for p in [marion_oaks_prop, sw38th_prop] if p]
+    
+    for rm_tx in realty_medics_txs:
+        if rm_tx.id in matched_realty_medics_ids:
+            continue
+        
+        # Use transaction_date for matching
+        rm_date = parse_date(rm_tx.transaction_date)
+        if not rm_date:
+            continue
+        
+        rm_amount = rm_tx.amount  # Can be positive (income) or negative (expense)
+        
+        # Must match category and sub-category
+        rm_category = (rm_tx.stessa_category or '').strip()
+        rm_sub_category = (rm_tx.stessa_sub_category or '').strip()
+        
+        # Determine which properties to check
+        # If property_id is set, only check that property
+        # Otherwise, check both Realty Medics properties (combined report)
+        properties_to_check = []
+        if rm_tx.property_id:
+            prop = session.get(Property, rm_tx.property_id)
+            if prop:
+                properties_to_check = [prop]
+        else:
+            properties_to_check = realty_medics_properties
+        
+        if not properties_to_check:
+            continue
+        
+        # First, try exact single transaction match
+        single_match = None
+        for prop in properties_to_check:
+            for s_tx in stessa_txs:
+                if s_tx.id in matched_stessa_ids:
+                    continue
+                
+                # Must be same property
+                if s_tx.property_id != prop.id:
+                    continue
+                
+                # Must match category and sub-category
+                stessa_category = (s_tx.category or '').strip()
+                stessa_sub_category = (s_tx.sub_category or '').strip()
+                
+                # Special handling: Capital Expenses can match Repairs & Maintenance for large landscaping projects
+                # (Realty Medics may categorize as "Repairs" but Stessa correctly categorizes as "Capital Expenses")
+                category_match = False
+                if stessa_category.lower() == rm_category.lower():
+                    category_match = True
+                elif (stessa_category.lower() == 'capital expenses' and 
+                      rm_category.lower() == 'repairs & maintenance' and
+                      abs(rm_amount) > 1000):  # Large amounts are more likely to be capital expenses
+                    category_match = True
+                elif (stessa_category.lower() == 'repairs & maintenance' and
+                      rm_category.lower() == 'capital expenses' and
+                      abs(rm_amount) > 1000):
+                    category_match = True
+                
+                if not category_match:
+                    continue
+                # For Management Fees, use standardized sub-category matching
+                if rm_category.lower() == 'management fees':
+                    if not matches_management_fee_subcategory(stessa_sub_category, rm_sub_category):
+                        continue
+                # For Capital Expenses, allow flexible sub-category matching (e.g., "New Landscaping" vs empty)
+                # Also handle when Stessa has Capital Expenses but RM has Repairs & Maintenance
+                if stessa_category.lower() == 'capital expenses' or rm_category.lower() == 'capital expenses':
+                    # If either sub-category is empty, consider it a match
+                    # If both have values, allow partial matches (e.g., "New Landscaping" contains "Landscaping")
+                    if rm_sub_category and stessa_sub_category:
+                        rm_sub_lower = rm_sub_category.lower()
+                        stessa_sub_lower = stessa_sub_category.lower()
+                        if (rm_sub_lower != stessa_sub_lower and
+                            rm_sub_lower not in stessa_sub_lower and
+                            stessa_sub_lower not in rm_sub_lower):
+                            continue
+                elif rm_category.lower() == 'capital expenses':
+                    # If either sub-category is empty, consider it a match
+                    # If both have values, allow partial matches (e.g., "New Landscaping" contains "Landscaping")
+                    if rm_sub_category and stessa_sub_category:
+                        rm_sub_lower = rm_sub_category.lower()
+                        stessa_sub_lower = stessa_sub_category.lower()
+                        if (rm_sub_lower != stessa_sub_lower and
+                            rm_sub_lower not in stessa_sub_lower and
+                            stessa_sub_lower not in rm_sub_lower):
+                            continue
+                # For other categories: if either is empty, consider it a match
+                elif rm_sub_category and stessa_sub_category:
+                    if stessa_sub_category.lower() != rm_sub_category.lower():
+                        continue
+                
+                s_date = parse_date(s_tx.date)
+                if not s_date:
+                    continue
+                
+                # Exact amount match (handle sign differences for utilities - RM shows as income, Stessa as expense)
+                # For Utilities/Water & Sewer, compare absolute values since RM shows positive but Stessa shows negative
+                if rm_category.lower() == "utilities" and rm_sub_category.lower() == "water & sewer":
+                    amount_match = abs(abs(s_tx.amount) - abs(rm_amount)) < 0.01
+                else:
+                    amount_match = abs(s_tx.amount - rm_amount) < 0.01
+                
+                if amount_match:
+                    date_diff = abs((s_date - rm_date).days)
+                    if date_diff <= 30:
+                        if single_match is None or date_diff < single_match[2]:
+                            single_match = (s_tx, prop, date_diff)
+        
+        # If exact match found, use it
+        if single_match:
+            best_s_tx, matched_prop, best_diff = single_match
+            match = ReconciliationMatch(
+                stessa_id=best_s_tx.id,
+                realty_medics_id=rm_tx.id,
+                match_score=1.0,
+                match_type='realty_medics',
+                notes=f"Realty Medics match: {rm_tx.account_name} ({rm_tx.transaction_type}), Property: {matched_prop.stessa_name}, Date diff={best_diff}d, Amount={rm_amount:.2f}"
+            )
+            session.add(match)
+            matched_stessa_ids.add(best_s_tx.id)
+            matched_realty_medics_ids.add(rm_tx.id)
+            matches_count += 1
+            continue
+        
+        # If no exact match, try split payment matching for individual properties
+        # This handles cases where multiple Stessa transactions sum to a single Realty Medics transaction
+        # (e.g., rent paid in multiple installments)
+        found_match = False
+        if rm_tx.property_id and len(properties_to_check) == 1:
+            # Try to find combination of transactions from the same property that sum to rm_amount
+            prop_to_check = properties_to_check[0]
+            candidate_txs = []
+            for s_tx in stessa_txs:
+                if s_tx.id in matched_stessa_ids:
+                    continue
+                
+                if s_tx.property_id != prop_to_check.id:
+                    continue
+                
+                stessa_category = (s_tx.category or '').strip()
+                stessa_sub_category = (s_tx.sub_category or '').strip()
+                
+                if stessa_category.lower() != rm_category.lower():
+                    continue
+                # For Management Fees, use standardized sub-category matching
+                if rm_category.lower() == 'management fees':
+                    if not matches_management_fee_subcategory(stessa_sub_category, rm_sub_category):
+                        continue
+                # For other categories: if either is empty, consider it a match
+                elif rm_sub_category and stessa_sub_category:
+                    if stessa_sub_category.lower() != rm_sub_category.lower():
+                        continue
+                
+                s_date = parse_date(s_tx.date)
+                if not s_date:
+                    continue
+                
+                date_diff = abs((s_date - rm_date).days)
+                if date_diff <= 30:
+                    # For Utilities/Water & Sewer, allow opposite signs (RM shows as income, Stessa as expense)
+                    # For other categories, require same sign
+                    if rm_category.lower() == "utilities" and rm_sub_category.lower() == "water & sewer":
+                        candidate_txs.append((s_tx, date_diff))
+                    elif (s_tx.amount * rm_amount) > 0:  # Same sign
+                        candidate_txs.append((s_tx, date_diff))
+            
+            # Try combinations of 2-5 transactions (rent can be split into multiple payments)
+            if candidate_txs:
+                candidate_txs.sort(key=lambda x: x[1])  # Sort by date difference
+                
+                for combo_size in range(2, min(6, len(candidate_txs) + 1)):
+                    for combo in combinations(candidate_txs, combo_size):
+                        combo_txs = [tx for tx, _ in combo]
+                        if any(tx.id in matched_stessa_ids for tx in combo_txs):
+                            continue
+                        
+                        total_amount = sum(tx.amount for tx in combo_txs)
+                        # For Utilities/Water & Sewer, compare absolute values (handle sign differences)
+                        if rm_category.lower() == "utilities" and rm_sub_category.lower() == "water & sewer":
+                            amount_match = abs(abs(total_amount) - abs(rm_amount)) < 0.01
+                        else:
+                            amount_match = abs(total_amount - rm_amount) < 0.01
+                        
+                        if amount_match:
+                            # Found a match! Create match records for all transactions
+                            primary_tx, primary_diff = combo[0]
+                            # Create primary match with full details
+                            match = ReconciliationMatch(
+                                stessa_id=primary_tx.id,
+                                realty_medics_id=rm_tx.id,
+                                match_score=0.95,
+                                match_type='realty_medics_split',
+                                notes=f"Realty Medics split payment match: {rm_tx.account_name} ({rm_tx.transaction_type}), {len(combo_txs)} transactions totaling ${rm_amount:.2f}, Property: {prop_to_check.stessa_name}, Date diff={primary_diff}d"
+                            )
+                            session.add(match)
+                            matched_stessa_ids.add(primary_tx.id)
+                            matches_count += 1
+                            
+                            # Create match records for remaining transactions (link them to the same Realty Medics transaction)
+                            for tx, _ in combo[1:]:
+                                match = ReconciliationMatch(
+                                    stessa_id=tx.id,
+                                    realty_medics_id=rm_tx.id,
+                                    match_score=0.95,
+                                    match_type='realty_medics_split',
+                                    notes=f"Realty Medics split payment (part of {len(combo_txs)} transactions totaling ${rm_amount:.2f})"
+                                )
+                                session.add(match)
+                                matched_stessa_ids.add(tx.id)
+                                matches_count += 1
+                            
+                            matched_realty_medics_ids.add(rm_tx.id)
+                            found_match = True
+                            break
+                    
+                    if found_match:
+                        break
+    
+    # --- PHASE 5: Renshaw Transaction Matching ---
+    print("PHASE 5: Matching Renshaw transactions with Stessa...")
+    matched_renshaw_ids = set()
+    
+    # Get the Lone Rock property
+    lone_rock_prop = session.query(Property).filter(Property.stessa_name.ilike('%lone%rock%')).first()
+    
+    # First, match rent and management fees
+    for renshaw_tx in renshaw_txs:
+        if renshaw_tx.id in matched_renshaw_ids:
+            continue
+        
+        renshaw_date = parse_date(renshaw_tx.transaction_date)
+        if not renshaw_date:
+            continue
+        
+        renshaw_amount = renshaw_tx.amount
+        renshaw_category = (renshaw_tx.stessa_category or '').strip()
+        renshaw_sub_category = (renshaw_tx.stessa_sub_category or '').strip()
+        
+        # Must match property
+        if not renshaw_tx.property_id or not lone_rock_prop:
+            continue
+        
+        if renshaw_tx.property_id != lone_rock_prop.id:
+            continue
+        
+        # First, try exact single transaction match
+        single_match = None
+        for s_tx in stessa_txs:
+            if s_tx.id in matched_stessa_ids:
+                continue
+            
+            if s_tx.property_id != lone_rock_prop.id:
+                continue
+            
+            stessa_category = (s_tx.category or '').strip()
+            stessa_sub_category = (s_tx.sub_category or '').strip()
+            
+            if stessa_category.lower() != renshaw_category.lower():
+                continue
+            
+            # For Management Fees, use standardized sub-category matching
+            if renshaw_category.lower() == 'management fees':
+                if not matches_management_fee_subcategory(stessa_sub_category, renshaw_sub_category):
+                    continue
+            # For other categories: if either is empty, consider it a match
+            elif renshaw_sub_category and stessa_sub_category:
+                if stessa_sub_category.lower() != renshaw_sub_category.lower():
+                    continue
+            
+            s_date = parse_date(s_tx.date)
+            if not s_date:
+                continue
+            
+            # Exact amount match
+            if abs(s_tx.amount - renshaw_amount) < 0.01:
+                date_diff = abs((s_date - renshaw_date).days)
+                if date_diff <= 30:
+                    if single_match is None or date_diff < single_match[1]:
+                        single_match = (s_tx, date_diff)
+        
+        # If exact match found, use it
+        if single_match:
+            best_s_tx, best_diff = single_match
+            match = ReconciliationMatch(
+                stessa_id=best_s_tx.id,
+                renshaw_id=renshaw_tx.id,
+                match_score=1.0,
+                match_type='renshaw',
+                notes=f"Renshaw match: {renshaw_tx.account_name} ({renshaw_tx.transaction_type}), Property: {lone_rock_prop.stessa_name}, Date diff={best_diff}d, Amount={renshaw_amount:.2f}"
+            )
+            session.add(match)
+            matched_stessa_ids.add(best_s_tx.id)
+            matched_renshaw_ids.add(renshaw_tx.id)
+            matches_count += 1
+            continue
+        
+        # Try split payment matching (multiple Stessa transactions sum to one Renshaw transaction)
+        candidate_txs = []
+        for s_tx in stessa_txs:
+            if s_tx.id in matched_stessa_ids:
+                continue
+            
+            if s_tx.property_id != lone_rock_prop.id:
+                continue
+            
+            stessa_category = (s_tx.category or '').strip()
+            stessa_sub_category = (s_tx.sub_category or '').strip()
+            
+            if stessa_category.lower() != renshaw_category.lower():
+                continue
+            # For Management Fees, use standardized sub-category matching
+            if renshaw_category.lower() == 'management fees':
+                if not matches_management_fee_subcategory(stessa_sub_category, renshaw_sub_category):
+                    continue
+            # For other categories: if either is empty, consider it a match
+            elif renshaw_sub_category and stessa_sub_category:
+                if stessa_sub_category.lower() != renshaw_sub_category.lower():
+                    continue
+            
+            s_date = parse_date(s_tx.date)
+            if not s_date:
+                continue
+            
+            date_diff = abs((s_date - renshaw_date).days)
+            if date_diff <= 30:
+                if (s_tx.amount * renshaw_amount) > 0:  # Same sign
+                    candidate_txs.append((s_tx, date_diff))
+        
+        # Try combinations of 2-5 transactions
+        if candidate_txs:
+            candidate_txs.sort(key=lambda x: x[1])
+            
+            for combo_size in range(2, min(6, len(candidate_txs) + 1)):
+                for combo in combinations(candidate_txs, combo_size):
+                    combo_txs = [tx for tx, _ in combo]
+                    if any(tx.id in matched_stessa_ids for tx in combo_txs):
+                        continue
+                    
+                    total_amount = sum(tx.amount for tx in combo_txs)
+                    if abs(total_amount - renshaw_amount) < 0.01:
+                        primary_tx, primary_diff = combo[0]
+                        # Create primary match with full details
+                        match = ReconciliationMatch(
+                            stessa_id=primary_tx.id,
+                            renshaw_id=renshaw_tx.id,
+                            match_score=0.95,
+                            match_type='renshaw_split',
+                            notes=f"Renshaw split payment match: {renshaw_tx.account_name} ({renshaw_tx.transaction_type}), {len(combo_txs)} transactions totaling ${renshaw_amount:.2f}, Property: {lone_rock_prop.stessa_name}, Date diff={primary_diff}d"
+                        )
+                        session.add(match)
+                        matched_stessa_ids.add(primary_tx.id)
+                        matches_count += 1
+                        
+                        # Create match records for remaining transactions (link them to the same Renshaw transaction)
+                        for tx, _ in combo[1:]:
+                            match = ReconciliationMatch(
+                                stessa_id=tx.id,
+                                renshaw_id=renshaw_tx.id,
+                                match_score=0.95,
+                                match_type='renshaw_split',
+                                notes=f"Renshaw split payment (part of {len(combo_txs)} transactions totaling ${renshaw_amount:.2f})"
+                            )
+                            session.add(match)
+                            matched_stessa_ids.add(tx.id)
+                            matches_count += 1
+                        
+                        matched_renshaw_ids.add(renshaw_tx.id)
+                        break
+                
+                if renshaw_tx.id in matched_renshaw_ids:
+                    break
+        
+        # If still no match and it's a management fee, try monthly aggregation
+        # (similar to Mike & Mikes - management fees may be split across multiple transactions)
+        if renshaw_tx.id not in matched_renshaw_ids and renshaw_category.lower() == 'management fees':
+            # Get all transactions in the same month (same year and month)
+            month_candidates = []
+            for s_tx in stessa_txs:
+                if s_tx.id in matched_stessa_ids:
+                    continue
+                
+                if s_tx.property_id != lone_rock_prop.id:
+                    continue
+                
+                stessa_category = (s_tx.category or '').strip()
+                stessa_sub_category = (s_tx.sub_category or '').strip()
+                
+                if stessa_category.lower() != renshaw_category.lower():
+                    continue
+                
+                # For Management Fees, use standardized sub-category matching
+                if renshaw_category.lower() == 'management fees':
+                    if not matches_management_fee_subcategory(stessa_sub_category, renshaw_sub_category):
+                        continue
+                # For other categories: sub-category matching
+                elif renshaw_sub_category and stessa_sub_category:
+                    if stessa_sub_category.lower() != renshaw_sub_category.lower():
+                        continue
+                
+                s_date = parse_date(s_tx.date)
+                if not s_date:
+                    continue
+                
+                # Check if same month and year
+                if s_date.year == renshaw_date.year and s_date.month == renshaw_date.month:
+                    if (s_tx.amount * renshaw_amount) > 0:  # Same sign
+                        month_candidates.append(s_tx)
+            
+            # Sum all month candidates and check if total matches
+            if month_candidates:
+                # Filter out already matched transactions for the sum calculation
+                unmatched_candidates = [tx for tx in month_candidates if tx.id not in matched_stessa_ids]
+                if unmatched_candidates:
+                    total_month_amount = sum(tx.amount for tx in unmatched_candidates)
+                    if abs(total_month_amount - renshaw_amount) < 0.01:
+                        # Found a monthly match! Create match records for all unmatched transactions
+                        primary_tx = unmatched_candidates[0]
+                        # Create primary match with full details
+                        match = ReconciliationMatch(
+                            stessa_id=primary_tx.id,
+                            renshaw_id=renshaw_tx.id,
+                            match_score=0.90,
+                            match_type='renshaw_monthly',
+                            notes=f"Renshaw monthly aggregation match: {renshaw_tx.account_name} ({renshaw_tx.transaction_type}), {len(unmatched_candidates)} transactions in {renshaw_date.strftime('%B %Y')} totaling ${renshaw_amount:.2f}, Property: {lone_rock_prop.stessa_name}"
+                        )
+                        session.add(match)
+                        matched_stessa_ids.add(primary_tx.id)
+                        matches_count += 1
+                        
+                        # Create match records for remaining transactions (link them to the same Renshaw transaction)
+                        for tx in unmatched_candidates[1:]:
+                            match = ReconciliationMatch(
+                                stessa_id=tx.id,
+                                renshaw_id=renshaw_tx.id,
+                                match_score=0.90,
+                                match_type='renshaw_monthly',
+                                notes=f"Renshaw monthly aggregation (part of {len(unmatched_candidates)} transactions totaling ${renshaw_amount:.2f})"
+                            )
+                            session.add(match)
+                            matched_stessa_ids.add(tx.id)
+                            matches_count += 1
+                        
+                        matched_renshaw_ids.add(renshaw_tx.id)
+    
+    # Now match owner distributions (calculated as rent - management fees per month)
+    # Group Renshaw transactions by month
+    from collections import defaultdict
+    renshaw_by_month = defaultdict(lambda: {'rent': None, 'mgmt_fee': None})
+    
+    for renshaw_tx in renshaw_txs:
+        renshaw_date = parse_date(renshaw_tx.transaction_date)
+        if not renshaw_date:
+            continue
+        
+        month_key = (renshaw_date.year, renshaw_date.month)
+        
+        if renshaw_tx.stessa_category == 'Income' and renshaw_tx.stessa_sub_category == 'Rents':
+            renshaw_by_month[month_key]['rent'] = renshaw_tx
+        elif renshaw_tx.stessa_category == 'Management Fees':
+            renshaw_by_month[month_key]['mgmt_fee'] = renshaw_tx
+    
+    # For each month with both rent and management fee, calculate expected distribution
+    for month_key, data in renshaw_by_month.items():
+        rent_tx = data['rent']
+        mgmt_tx = data['mgmt_fee']
+        
+        if rent_tx and mgmt_tx:
+            # Calculate expected owner distribution: rent - management fee
+            expected_distribution = rent_tx.amount + mgmt_tx.amount  # mgmt_tx.amount is negative, so we add
+            
+            # Look for Stessa transactions matching this distribution amount
+            # These are typically "Renshaw Property Sigonfil" payments
+            # They can be categorized as "Income/Rents" or "Transfers/Owner Distributions"
+            distribution_candidates = []
+            for s_tx in stessa_txs:
+                if s_tx.id in matched_stessa_ids:
+                    continue
+                
+                if s_tx.property_id != lone_rock_prop.id:
+                    continue
+                
+                # Check if it's a Renshaw-related distribution
+                if 'renshaw' not in (s_tx.name or '').lower():
+                    continue
+                
+                # Check if amount matches (within tolerance)
+                if abs(s_tx.amount - expected_distribution) < 0.01:
+                    s_date = parse_date(s_tx.date)
+                    if not s_date:
+                        continue
+                    
+                    # Check if same month
+                    if s_date.year == month_key[0] and s_date.month == month_key[1]:
+                        # Accept if categorized as Income/Rents or Transfers/Owner Distributions
+                        # Owner distributions from property managers may be categorized either way
+                        stessa_category = (s_tx.category or '').strip()
+                        stessa_sub_category = (s_tx.sub_category or '').strip()
+                        if ((stessa_category == 'Income' and stessa_sub_category == 'Rents') or
+                            (stessa_category == 'Transfers' and stessa_sub_category == 'Owner Distributions')):
+                            rent_date = parse_date(rent_tx.transaction_date)
+                            if rent_date:
+                                date_diff = abs((s_date - rent_date).days)
+                                distribution_candidates.append((s_tx, date_diff))
+            
+            # Match the best candidate (closest date)
+            if distribution_candidates:
+                distribution_candidates.sort(key=lambda x: x[1])
+                best_s_tx, best_diff = distribution_candidates[0]
+                
+                # Create match record linking to the rent transaction (as primary)
+                match = ReconciliationMatch(
+                    stessa_id=best_s_tx.id,
+                    renshaw_id=rent_tx.id,  # Link to rent transaction
+                    match_score=0.90,
+                    match_type='renshaw_distribution',
+                    notes=f"Renshaw owner distribution: {expected_distribution:.2f} (Rent ${rent_tx.amount:.2f} - Mgmt Fee ${abs(mgmt_tx.amount):.2f}), Property: {lone_rock_prop.stessa_name}, Date diff={best_diff}d"
+                )
+                session.add(match)
+                matched_stessa_ids.add(best_s_tx.id)
+                matches_count += 1
+    
+    # --- PHASE 6: Allstar Transaction Matching ---
+    print("PHASE 6: Matching Allstar transactions with Stessa...")
+    matched_allstar_ids = set()
+    
+    # Get the Malacca St property
+    malacca_prop = session.query(Property).filter(Property.stessa_name.ilike('%malacca%')).first()
+    
+    for allstar_tx in allstar_txs:
+        if allstar_tx.id in matched_allstar_ids:
+            continue
+        
+        allstar_date = parse_date(allstar_tx.transaction_date)
+        if not allstar_date:
+            continue
+        
+        allstar_amount = allstar_tx.amount
+        allstar_category = (allstar_tx.stessa_category or '').strip()
+        allstar_sub_category = (allstar_tx.stessa_sub_category or '').strip()
+        
+        # Must match property
+        if not allstar_tx.property_id or not malacca_prop:
+            continue
+        
+        if allstar_tx.property_id != malacca_prop.id:
+            continue
+        
+        # First, try exact single transaction match
+        single_match = None
+        for s_tx in stessa_txs:
+            if s_tx.id in matched_stessa_ids:
+                continue
+            
+            if s_tx.property_id != malacca_prop.id:
+                continue
+            
+            stessa_category = (s_tx.category or '').strip()
+            stessa_sub_category = (s_tx.sub_category or '').strip()
+            
+            if stessa_category.lower() != allstar_category.lower():
+                continue
+            
+            # For Management Fees, use standardized sub-category matching
+            if allstar_category.lower() == 'management fees':
+                if not matches_management_fee_subcategory(stessa_sub_category, allstar_sub_category):
+                    continue
+            # For other categories: if either is empty, consider it a match
+            # Also allow if one contains the other (e.g., "Gas" vs "Gas & Electric")
+            elif allstar_sub_category and stessa_sub_category:
+                if (stessa_sub_category.lower() != allstar_sub_category.lower() and
+                    allstar_sub_category.lower() not in stessa_sub_category.lower() and
+                    stessa_sub_category.lower() not in allstar_sub_category.lower()):
+                    continue
+            
+            s_date = parse_date(s_tx.date)
+            if not s_date:
+                continue
+            
+            # Amount match - handle sign differences for utilities
+            if allstar_category.lower() == "utilities":
+                if allstar_sub_category.lower() == "water & sewer":
+                    # Allstar shows as income (positive), Stessa as expense (negative)
+                    # Compare absolute values
+                    amount_match = abs(abs(s_tx.amount) - abs(allstar_amount)) < 0.01
+                    # Also check transaction type matches sign
+                    if allstar_tx.transaction_type == "Income" and s_tx.amount < 0:
+                        amount_match = False
+                    if allstar_tx.transaction_type == "Expense" and s_tx.amount > 0:
+                        amount_match = False
+                elif allstar_sub_category.lower() == "gas":
+                    # Gas should match by exact amount and same sign
+                    amount_match = abs(s_tx.amount - allstar_amount) < 0.01
+                else:
+                    amount_match = abs(s_tx.amount - allstar_amount) < 0.01
+            else:
+                amount_match = abs(s_tx.amount - allstar_amount) < 0.01
+            
+            if amount_match:
+                date_diff = abs((s_date - allstar_date).days)
+                # For utilities, prefer transactions on or after the statement date
+                # (utility bills are typically paid after the statement date)
+                if allstar_category.lower() == "utilities":
+                    if s_date < allstar_date:
+                        # Transaction before statement date - less likely to be correct
+                        # Only consider if it's very close (within 5 days)
+                        if date_diff > 5:
+                            continue
+                    # Calculate date difference (positive if after statement date)
+                    date_diff_after = (s_date - allstar_date).days
+                    # Prefer transactions after the statement date
+                    if date_diff <= 30:
+                        if single_match is None:
+                            single_match = (s_tx, date_diff, date_diff_after)
+                        else:
+                            _, best_diff, best_diff_after = single_match
+                            # Prefer transaction after statement date, or closer date if both before/after
+                            if date_diff_after >= 0 and best_diff_after < 0:
+                                single_match = (s_tx, date_diff, date_diff_after)
+                            elif date_diff_after >= 0 and best_diff_after >= 0:
+                                if date_diff < best_diff:
+                                    single_match = (s_tx, date_diff, date_diff_after)
+                            elif date_diff_after < 0 and best_diff_after < 0:
+                                if date_diff < best_diff:
+                                    single_match = (s_tx, date_diff, date_diff_after)
+                else:
+                    if date_diff <= 30:
+                        if single_match is None or date_diff < single_match[1]:
+                            single_match = (s_tx, date_diff, 0)  # Add dummy third element for consistency
+        
+        # If exact match found, use it
+        if single_match:
+            best_s_tx, best_diff, _ = single_match
+            match = ReconciliationMatch(
+                stessa_id=best_s_tx.id,
+                allstar_id=allstar_tx.id,
+                match_score=1.0,
+                match_type='allstar',
+                notes=f"Allstar match: {allstar_tx.account_name} ({allstar_tx.transaction_type}), Property: {malacca_prop.stessa_name}, Date diff={best_diff}d, Amount={allstar_amount:.2f}"
+            )
+            session.add(match)
+            matched_stessa_ids.add(best_s_tx.id)
+            matched_allstar_ids.add(allstar_tx.id)
+            matches_count += 1
+            continue
+        
+        # Try split payment matching
+        candidate_txs = []
+        for s_tx in stessa_txs:
+            if s_tx.id in matched_stessa_ids:
+                continue
+            
+            if s_tx.property_id != malacca_prop.id:
+                continue
+            
+            stessa_category = (s_tx.category or '').strip()
+            stessa_sub_category = (s_tx.sub_category or '').strip()
+            
+            if stessa_category.lower() != allstar_category.lower():
+                continue
+            
+            # For Management Fees, use standardized sub-category matching
+            if allstar_category.lower() == 'management fees':
+                if not matches_management_fee_subcategory(stessa_sub_category, allstar_sub_category):
+                    continue
+            # For other categories: sub-category matching with flexibility
+            elif allstar_sub_category and stessa_sub_category:
+                if (stessa_sub_category.lower() != allstar_sub_category.lower() and
+                    allstar_sub_category.lower() not in stessa_sub_category.lower() and
+                    stessa_sub_category.lower() not in allstar_sub_category.lower()):
+                    continue
+            
+            s_date = parse_date(s_tx.date)
+            if not s_date:
+                continue
+            
+            date_diff = abs((s_date - allstar_date).days)
+            if date_diff <= 30:
+                # For Utilities/Water & Sewer, handle sign differences
+                if allstar_category.lower() == "utilities" and allstar_sub_category.lower() == "water & sewer":
+                    candidate_txs.append((s_tx, date_diff))
+                elif allstar_category.lower() == "utilities" and allstar_sub_category.lower() == "gas":
+                    # Gas should match by exact amount and same sign
+                    if abs(s_tx.amount - allstar_amount) < 0.01:
+                        candidate_txs.append((s_tx, date_diff))
+                elif (s_tx.amount * allstar_amount) > 0:  # Same sign
+                    candidate_txs.append((s_tx, date_diff))
+        
+        # Try combinations of 2-5 transactions
+        if candidate_txs:
+            candidate_txs.sort(key=lambda x: x[1])
+            
+            for combo_size in range(2, min(6, len(candidate_txs) + 1)):
+                for combo in combinations(candidate_txs, combo_size):
+                    combo_txs = [tx for tx, _ in combo]
+                    if any(tx.id in matched_stessa_ids for tx in combo_txs):
+                        continue
+                    
+                    total_amount = sum(tx.amount for tx in combo_txs)
+                    # For Utilities/Water & Sewer, compare absolute values
+                    if allstar_category.lower() == "utilities" and allstar_sub_category.lower() == "water & sewer":
+                        amount_match = abs(abs(total_amount) - abs(allstar_amount)) < 0.01
+                    else:
+                        amount_match = abs(total_amount - allstar_amount) < 0.01
+                    
+                    if amount_match:
+                        primary_tx, primary_diff = combo[0]
+                        # Create primary match with full details
+                        match = ReconciliationMatch(
+                            stessa_id=primary_tx.id,
+                            allstar_id=allstar_tx.id,
+                            match_score=0.95,
+                            match_type='allstar_split',
+                            notes=f"Allstar split payment match: {allstar_tx.account_name} ({allstar_tx.transaction_type}), {len(combo_txs)} transactions totaling ${allstar_amount:.2f}, Property: {malacca_prop.stessa_name}, Date diff={primary_diff}d"
+                        )
+                        session.add(match)
+                        matched_stessa_ids.add(primary_tx.id)
+                        matches_count += 1
+                        
+                        # Create match records for remaining transactions (link them to the same Allstar transaction)
+                        for tx, _ in combo[1:]:
+                            match = ReconciliationMatch(
+                                stessa_id=tx.id,
+                                allstar_id=allstar_tx.id,
+                                match_score=0.95,
+                                match_type='allstar_split',
+                                notes=f"Allstar split payment (part of {len(combo_txs)} transactions totaling ${allstar_amount:.2f})"
+                            )
+                            session.add(match)
+                            matched_stessa_ids.add(tx.id)
+                            matches_count += 1
+                        
+                        matched_allstar_ids.add(allstar_tx.id)
+                        break
+                
+                if allstar_tx.id in matched_allstar_ids:
+                    break
+    
+    # --- PHASE 7: Mike & Mikes Transaction Matching ---
+    print("PHASE 7: Matching Mike & Mikes transactions with Stessa...")
+    matched_mike_mikes_ids = set()
+    
+    # Get the 4708 N 36th St property
+    mike_mikes_prop = session.query(Property).filter(
+        Property.stessa_name.ilike('%36th%') | 
+        Property.address_display.ilike('%36th%')
+    ).first()
+    
+    for mike_mikes_tx in mike_mikes_txs:
+        if mike_mikes_tx.id in matched_mike_mikes_ids:
+            continue
+        
+        mm_date = parse_date(mike_mikes_tx.transaction_date)
+        if not mm_date:
+            continue
+        
+        mm_amount = mike_mikes_tx.amount
+        mm_category = (mike_mikes_tx.stessa_category or '').strip()
+        mm_sub_category = (mike_mikes_tx.stessa_sub_category or '').strip()
+        
+        # Must match property
+        if not mike_mikes_tx.property_id or not mike_mikes_prop:
+            continue
+        
+        if mike_mikes_tx.property_id != mike_mikes_prop.id:
+            continue
+        
+        # For management fees, prefer monthly aggregation over direct/split matches
+        # (since statements show monthly totals that may be split across multiple transactions)
+        is_management_fee = mm_category.lower() == 'management fees'
+        
+        # First, try exact single transaction match
+        single_match = None
+        for s_tx in stessa_txs:
+            if s_tx.id in matched_stessa_ids:
+                continue
+            
+            if s_tx.property_id != mike_mikes_prop.id:
+                continue
+            
+            stessa_category = (s_tx.category or '').strip()
+            stessa_sub_category = (s_tx.sub_category or '').strip()
+            
+            if stessa_category.lower() != mm_category.lower():
+                continue
+            
+            # For Management Fees, use standardized sub-category matching
+            if mm_category.lower() == 'management fees':
+                if not matches_management_fee_subcategory(stessa_sub_category, mm_sub_category):
+                    continue
+            # For other categories: if either is empty, consider it a match
+            # Also allow if one contains the other
+            elif mm_sub_category and stessa_sub_category:
+                if (stessa_sub_category.lower() != mm_sub_category.lower() and
+                    mm_sub_category.lower() not in stessa_sub_category.lower() and
+                    stessa_sub_category.lower() not in mm_sub_category.lower()):
+                    continue
+            
+            s_date = parse_date(s_tx.date)
+            if not s_date:
+                continue
+            
+            # Exact amount match
+            if abs(s_tx.amount - mm_amount) < 0.01:
+                date_diff = abs((s_date - mm_date).days)
+                if date_diff <= 30:
+                    if single_match is None or date_diff < single_match[1]:
+                        single_match = (s_tx, date_diff)
+        
+        # If exact match found, use it (unless it's a management fee - prefer monthly aggregation for those)
+        # For management fees, we want monthly aggregation to handle multiple transactions summing to monthly total
+        if single_match and not is_management_fee:
+            best_s_tx, best_diff = single_match
+            match = ReconciliationMatch(
+                stessa_id=best_s_tx.id,
+                mike_mikes_id=mike_mikes_tx.id,
+                match_score=1.0,
+                match_type='mike_mikes',
+                notes=f"Mike & Mikes match: {mike_mikes_tx.description} ({mike_mikes_tx.transaction_type}), Property: {mike_mikes_prop.stessa_name}, Date diff={best_diff}d, Amount={mm_amount:.2f}"
+            )
+            session.add(match)
+            matched_stessa_ids.add(best_s_tx.id)
+            matched_mike_mikes_ids.add(mike_mikes_tx.id)
+            matches_count += 1
+            continue
+        
+        # Try split payment matching (combinations of 2-5 transactions within 30 days)
+        # Skip split payment matching for management fees - prefer monthly aggregation
+        candidate_txs = []
+        if not is_management_fee:
+            for s_tx in stessa_txs:
+                if s_tx.id in matched_stessa_ids:
+                    continue
+                
+                if s_tx.property_id != mike_mikes_prop.id:
+                    continue
+                
+                stessa_category = (s_tx.category or '').strip()
+                stessa_sub_category = (s_tx.sub_category or '').strip()
+                
+                if stessa_category.lower() != mm_category.lower():
+                    continue
+                
+                # For Management Fees, use standardized sub-category matching
+                if mm_category.lower() == 'management fees':
+                    if not matches_management_fee_subcategory(stessa_sub_category, mm_sub_category):
+                        continue
+                # For other categories: sub-category matching with flexibility
+                elif mm_sub_category and stessa_sub_category:
+                    if (stessa_sub_category.lower() != mm_sub_category.lower() and
+                        mm_sub_category.lower() not in stessa_sub_category.lower() and
+                        stessa_sub_category.lower() not in mm_sub_category.lower()):
+                        continue
+                
+                s_date = parse_date(s_tx.date)
+                if not s_date:
+                    continue
+                
+                date_diff = abs((s_date - mm_date).days)
+                if date_diff <= 30:
+                    if (s_tx.amount * mm_amount) > 0:  # Same sign
+                        candidate_txs.append((s_tx, date_diff))
+        
+        # Try combinations of 2-5 transactions (only if not management fee)
+        if candidate_txs and not is_management_fee:
+            candidate_txs.sort(key=lambda x: x[1])
+            
+            for combo_size in range(2, min(6, len(candidate_txs) + 1)):
+                for combo in combinations(candidate_txs, combo_size):
+                    combo_txs = [tx for tx, _ in combo]
+                    if any(tx.id in matched_stessa_ids for tx in combo_txs):
+                        continue
+                    
+                    total_amount = sum(tx.amount for tx in combo_txs)
+                    if abs(total_amount - mm_amount) < 0.01:
+                        primary_tx, primary_diff = combo[0]
+                        # Create primary match with full details
+                        match = ReconciliationMatch(
+                            stessa_id=primary_tx.id,
+                            mike_mikes_id=mike_mikes_tx.id,
+                            match_score=0.95,
+                            match_type='mike_mikes_split',
+                            notes=f"Mike & Mikes split payment match: {mike_mikes_tx.description} ({mike_mikes_tx.transaction_type}), {len(combo_txs)} transactions totaling ${mm_amount:.2f}, Property: {mike_mikes_prop.stessa_name}, Date diff={primary_diff}d"
+                        )
+                        session.add(match)
+                        matched_stessa_ids.add(primary_tx.id)
+                        matches_count += 1
+                        
+                        # Create match records for remaining transactions (link them to the same Mike & Mikes transaction)
+                        for tx, _ in combo[1:]:
+                            match = ReconciliationMatch(
+                                stessa_id=tx.id,
+                                mike_mikes_id=mike_mikes_tx.id,
+                                match_score=0.95,
+                                match_type='mike_mikes_split',
+                                notes=f"Mike & Mikes split payment (part of {len(combo_txs)} transactions totaling ${mm_amount:.2f})"
+                            )
+                            session.add(match)
+                            matched_stessa_ids.add(tx.id)
+                            matches_count += 1
+                        
+                        matched_mike_mikes_ids.add(mike_mikes_tx.id)
+                        break
+                
+                if mike_mikes_tx.id in matched_mike_mikes_ids:
+                    break
+        
+        # If still no match, try monthly aggregation
+        # Sum all transactions in the same month that match category/sub-category
+        if mike_mikes_tx.id not in matched_mike_mikes_ids:
+            # Get all transactions in the same month (same year and month)
+            month_candidates = []
+            for s_tx in stessa_txs:
+                if s_tx.id in matched_stessa_ids:
+                    continue
+                
+                if s_tx.property_id != mike_mikes_prop.id:
+                    continue
+                
+                stessa_category = (s_tx.category or '').strip()
+                stessa_sub_category = (s_tx.sub_category or '').strip()
+                
+                if stessa_category.lower() != mm_category.lower():
+                    continue
+                
+                # For Management Fees, use standardized sub-category matching
+                if mm_category.lower() == 'management fees':
+                    if not matches_management_fee_subcategory(stessa_sub_category, mm_sub_category):
+                        continue
+                # For other categories: sub-category matching with flexibility
+                elif mm_sub_category and stessa_sub_category:
+                    if (stessa_sub_category.lower() != mm_sub_category.lower() and
+                        mm_sub_category.lower() not in stessa_sub_category.lower() and
+                        stessa_sub_category.lower() not in mm_sub_category.lower()):
+                        continue
+                
+                s_date = parse_date(s_tx.date)
+                if not s_date:
+                    continue
+                
+                # Check if same month and year
+                if s_date.year == mm_date.year and s_date.month == mm_date.month:
+                    if (s_tx.amount * mm_amount) > 0:  # Same sign
+                        month_candidates.append(s_tx)
+            
+            # Sum all month candidates and check if total matches
+            if month_candidates:
+                # Filter out already matched transactions for the sum calculation
+                unmatched_candidates = [tx for tx in month_candidates if tx.id not in matched_stessa_ids]
+                if unmatched_candidates:
+                    total_month_amount = sum(tx.amount for tx in unmatched_candidates)
+                    if abs(total_month_amount - mm_amount) < 0.01:
+                        # Found a monthly match! Create match records for all unmatched transactions
+                        primary_tx = unmatched_candidates[0]
+                        # Create primary match with full details
+                        match = ReconciliationMatch(
+                            stessa_id=primary_tx.id,
+                            mike_mikes_id=mike_mikes_tx.id,
+                            match_score=0.90,
+                            match_type='mike_mikes_monthly',
+                            notes=f"Mike & Mikes monthly aggregation match: {mike_mikes_tx.description} ({mike_mikes_tx.transaction_type}), {len(unmatched_candidates)} transactions in {mm_date.strftime('%B %Y')} totaling ${mm_amount:.2f}, Property: {mike_mikes_prop.stessa_name}"
+                        )
+                        session.add(match)
+                        matched_stessa_ids.add(primary_tx.id)
+                        matches_count += 1
+                        
+                        # Create match records for remaining transactions (link them to the same Mike & Mikes transaction)
+                        for tx in unmatched_candidates[1:]:
+                            match = ReconciliationMatch(
+                                stessa_id=tx.id,
+                                mike_mikes_id=mike_mikes_tx.id,
+                                match_score=0.90,
+                                match_type='mike_mikes_monthly',
+                                notes=f"Mike & Mikes monthly aggregation (part of {len(unmatched_candidates)} transactions totaling ${mm_amount:.2f})"
+                            )
+                            session.add(match)
+                            matched_stessa_ids.add(tx.id)
+                            matches_count += 1
+                        
+                        matched_mike_mikes_ids.add(mike_mikes_tx.id)
+    
     session.commit()
     print(f"Reconciliation finished. Total matches: {matches_count}")
     if unsplit_mortgages:
         print(f"Found {len(unsplit_mortgages)} unsplit mortgage payment(s) needing to be split.")
     generate_report(session, unsplit_mortgages, year)
     session.close()
+
+def is_no_reconciliation_source(category, sub_category):
+    """
+    Determine if a transaction category/sub-category has no reconciliation source available.
+    These are transactions like Insurance, Taxes, HOA dues that won't be matched against
+    property management systems or mortgage statements.
+    """
+    cat_lower = (category or '').strip().lower()
+    sub_cat_lower = (sub_category or '').strip().lower()
+    
+    # Insurance transactions
+    if cat_lower == 'insurance':
+        return True
+    
+    # Tax transactions
+    if cat_lower == 'taxes':
+        return True
+    
+    # HOA dues and related admin items
+    if cat_lower == 'admin & other':
+        if 'hoa' in sub_cat_lower or 'dues' in sub_cat_lower:
+            return True
+        if 'licenses' in sub_cat_lower:
+            return True
+        if 'bank fees' in sub_cat_lower:
+            return True
+    
+    return False
 
 def generate_report(session, unsplit_mortgages=None, year=None):
     if unsplit_mortgages is None:
@@ -405,13 +1534,20 @@ def generate_report(session, unsplit_mortgages=None, year=None):
         pb_year_count = len(filter_by_year(all_pb, 'entryDate', year))
         
         all_mortgage = session.query(MortgageRaw).all()
-        mortgage_year_count = len(filter_by_year(all_mortgage, 'statement_date', year))
+        # For mortgage statements, count by payment_due_date (with fallback to statement_date)
+        mortgage_year_count = len([m for m in all_mortgage if (
+            (parse_date(m.payment_due_date) and parse_date(m.payment_due_date).year == year) or
+            (not m.payment_due_date and parse_date(m.statement_date) and parse_date(m.statement_date).year == year)
+        )])
         
         all_costar = session.query(CostarRaw).all()
         costar_year_count = len(filter_by_year(all_costar, 'completed_on', year))
     
     # Calculate unmatched counts for filtered year
-    matched_stessa_ids_all = [m.stessa_id for m in session.query(ReconciliationMatch).all()]
+    # Include all matches (automatic and manual)
+    matched_stessa_ids_all = [m.stessa_id for m in session.query(ReconciliationMatch).filter(
+        ReconciliationMatch.stessa_id.isnot(None)
+    ).all()]
     unmatched_stessa_all = session.query(StessaRaw).filter(
         ~StessaRaw.id.in_(matched_stessa_ids_all),
         StessaRaw.is_filtered == False
@@ -438,23 +1574,61 @@ def generate_report(session, unsplit_mortgages=None, year=None):
 
     # Unmatched Stessa (exclude filtered transactions)
     matched_stessa_ids = [m.stessa_id for m in session.query(ReconciliationMatch).all()]
-    unmatched_stessa = session.query(StessaRaw).filter(
+    unmatched_stessa_all = session.query(StessaRaw).filter(
         ~StessaRaw.id.in_(matched_stessa_ids),
         StessaRaw.is_filtered == False
     ).all()
     
     # Apply year filter if specified
     if year:
-        unmatched_stessa = filter_by_year(unmatched_stessa, 'date', year)
+        unmatched_stessa_all = filter_by_year(unmatched_stessa_all, 'date', year)
     
-    print(f"\nUNMATCHED STESSA (Top 15 by amount):")
-    unmatched_stessa.sort(key=lambda x: abs(x.amount), reverse=True)
+    # Separate transactions with no reconciliation source from other unmatched transactions
+    no_recon_source = []
+    unmatched_stessa = []
+    
+    for tx in unmatched_stessa_all:
+        if is_no_reconciliation_source(tx.category, tx.sub_category):
+            no_recon_source.append(tx)
+        else:
+            unmatched_stessa.append(tx)
+    
+    # Report transactions with no reconciliation source available
+    if no_recon_source:
+        # Sort by property (ascending), then category (ascending), then date (ascending)
+        no_recon_source.sort(key=lambda x: (
+            (x.property or '').strip().lower(),
+            (x.category or '').strip().lower(),
+            parse_date(x.date) or datetime.date.min
+        ))
+        
+        print(f"\nNO RECONCILIATION SOURCE AVAILABLE ({len(no_recon_source)}):")
+        print("ℹ️  These transactions (Insurance, Taxes, HOA dues, etc.) don't have reconciliation sources.")
+        print("    They are expected to remain unmatched and are excluded from the unmatched Stessa report.")
+        print(f"  {'Date':12} | {'Amount':>10} | {'Payee':30} | {'Category':25} | {'Property':25}")
+        print(f"  {'-'*12} | {'-'*10} | {'-'*30} | {'-'*25} | {'-'*25}")
+        
+        for tx in no_recon_source:
+            tx_date = parse_date(tx.date)
+            date_str = tx_date.strftime('%m/%d/%Y') if tx_date else tx.date
+            prop_display = (tx.property or 'N/A')[:25]
+            payee_display = (tx.name or 'N/A')[:30]
+            category_display = f"{tx.category or 'N/A'}/{tx.sub_category or ''}"[:25]
+            print(f"  {date_str:12} | ${tx.amount:>9.2f} | {payee_display:30} | {category_display:25} | {prop_display:25}")
+    
+    print(f"\nUNMATCHED STESSA:")
+    # Sort by property (ascending), then category (ascending), then date (ascending)
+    unmatched_stessa.sort(key=lambda x: (
+        (x.property or '').strip().lower(),
+        (x.category or '').strip().lower(),
+        parse_date(x.date) or datetime.date.min
+    ))
     
     # Print header with aligned columns
     print(f"  {'Date':12} | {'Amount':>10} | {'Payee':25} | {'Category':20} | {'Property':20}")
     print(f"  {'-'*12}-|-{'-'*10}-|-{'-'*25}-|-{'-'*20}-|-{'-'*20}")
     
-    for tx in unmatched_stessa[:15]:
+    for tx in unmatched_stessa:
         # Format date consistently as mm/dd/yyyy
         tx_date = parse_date(tx.date)
         if tx_date:
@@ -469,6 +1643,7 @@ def generate_report(session, unsplit_mortgages=None, year=None):
     
     # Items that are Income/Management but unmatched with Property Boss
     # Only show for PB-managed properties (non-PB-managed properties won't have PB matches)
+    # Exclude transactions with no reconciliation source
     unmatched_income_management = []
     for tx in unmatched_stessa:
         if 'Management' in tx.category or 'Income' in tx.category:
@@ -855,6 +2030,8 @@ def generate_report(session, unsplit_mortgages=None, year=None):
             print(f"    → Components already matched: {components_str}")
             print(f"    → Expected: Principal ({m.principal_breakdown or 0:.2f}), Interest ({m.interest_breakdown or 0:.2f}), Escrow ({m.escrow_breakdown or 0:.2f})")
             print(f"    → Date diff: {item['date_diff']} days")
+            if item.get('amount_diff', 0) > 0.01:
+                print(f"    → Amount diff: ${item['amount_diff']:.2f} (needs correction in Stessa)")
             print("")
     
     if unmatched_mort:
@@ -911,13 +2088,238 @@ def generate_report(session, unsplit_mortgages=None, year=None):
         if len(unmatched_costar) > 15:
             print(f"  ... and {len(unmatched_costar) - 15} more")
 
+def interactive_reconciliation_mode(year=None):
+    """
+    Interactive mode for manually marking transactions as reconciled.
+    Shows unmatched Stessa transactions and allows user to:
+    - Mark as reconciled with a reason
+    - Skip (leave unreconciled)
+    - View transaction details
+    - Exit and save progress
+    """
+    engine, Session = init_db()
+    session = Session()
+    
+    print("=" * 80)
+    print("INTERACTIVE RECONCILIATION MODE")
+    print("=" * 80)
+    print("\nThis mode allows you to manually mark transactions as reconciled.")
+    print("Transactions marked here will be excluded from unmatched reports.\n")
+    
+    # Get unmatched Stessa transactions
+    matched_ids = set([m.stessa_id for m in session.query(ReconciliationMatch).filter(
+        ReconciliationMatch.stessa_id.isnot(None)
+    ).all()])
+    
+    # Get all unmatched, unfiltered Stessa transactions
+    unmatched = session.query(StessaRaw).filter(
+        ~StessaRaw.id.in_(matched_ids),
+        StessaRaw.is_filtered == False
+    ).all()
+    
+    # Filter by year if specified
+    if year:
+        unmatched = [tx for tx in unmatched if parse_date(tx.date) and parse_date(tx.date).year == year]
+        print(f"Filtering to year {year}...")
+    
+    if not unmatched:
+        print("No unmatched transactions found.")
+        session.close()
+        return
+    
+    print(f"Found {len(unmatched)} unmatched transactions.\n")
+    
+    # Group by property for easier navigation
+    from collections import defaultdict
+    by_property = defaultdict(list)
+    for tx in unmatched:
+        if tx.property_id:
+            prop = session.query(Property).filter(Property.id == tx.property_id).first()
+            prop_name = prop.stessa_name if prop else "Unknown Property"
+        else:
+            prop_name = "No Property"
+        by_property[prop_name].append(tx)
+    
+    # Sort transactions by property, then date
+    for prop_name in sorted(by_property.keys()):
+        by_property[prop_name].sort(key=lambda x: parse_date(x.date) or datetime.date(1900, 1, 1))
+    
+    # Flatten back to list with numbering
+    numbered_txs = []
+    idx = 1
+    for prop_name in sorted(by_property.keys()):
+        for tx in by_property[prop_name]:
+            numbered_txs.append((idx, tx, prop_name))
+            idx += 1
+    
+    # Main loop
+    start_idx = 0
+    batch_size = 20
+    
+    while True:
+        # Display batch of transactions
+        end_idx = min(start_idx + batch_size, len(numbered_txs))
+        current_batch = numbered_txs[start_idx:end_idx]
+        
+        if not current_batch:
+            print("\nAll transactions processed!")
+            session.commit()
+            session.close()
+            return
+        
+        print("\n" + "=" * 80)
+        print(f"Showing transactions {start_idx + 1}-{end_idx} of {len(numbered_txs)}")
+        print("=" * 80)
+        print(f"{'#':<5} {'Date':<12} {'Amount':<12} {'Category':<25} {'Property':<30}")
+        print("-" * 80)
+        
+        for num, tx, prop_name in current_batch:
+            date_str = tx.date[:10] if len(tx.date) >= 10 else tx.date
+            amount_str = f"${tx.amount:,.2f}"
+            category_str = f"{tx.category}/{tx.sub_category}"[:24]
+            prop_str = prop_name[:29]
+            print(f"{num:<5} {date_str:<12} {amount_str:<12} {category_str:<25} {prop_str:<30}")
+        
+        print("\nCommands:")
+        print("  <number>     - Mark transaction as reconciled (will prompt for reason)")
+        print("  d<number>    - Show details for transaction")
+        print("  s<number>    - Skip transaction (leave unreconciled)")
+        print("  n            - Next batch")
+        print("  p            - Previous batch")
+        print("  q            - Quit and save progress")
+        
+        user_input = input("\nEnter command: ").strip().lower()
+        
+        if user_input == 'q':
+            session.commit()
+            print("\nProgress saved. Exiting interactive mode.")
+            session.close()
+            return
+        
+        if user_input == 'n':
+            start_idx = min(start_idx + batch_size, len(numbered_txs))
+            continue
+        
+        if user_input == 'p':
+            start_idx = max(0, start_idx - batch_size)
+            continue
+        
+        if user_input.startswith('d'):
+            # Show details
+            try:
+                num = int(user_input[1:])
+                # Find transaction by number
+                found = None
+                for n, tx, prop in numbered_txs:
+                    if n == num:
+                        found = (tx, prop)
+                        break
+                
+                if found:
+                    tx, prop_name = found
+                    print("\n" + "=" * 80)
+                    print("TRANSACTION DETAILS")
+                    print("=" * 80)
+                    print(f"Number: {num}")
+                    print(f"Date: {tx.date}")
+                    print(f"Amount: ${tx.amount:,.2f}")
+                    print(f"Name: {tx.name}")
+                    print(f"Category: {tx.category}")
+                    print(f"Sub-Category: {tx.sub_category}")
+                    print(f"Property: {prop_name}")
+                    print(f"Notes: {tx.notes or 'N/A'}")
+                    print(f"Details: {tx.details or 'N/A'}")
+                    print("=" * 80)
+                    input("\nPress Enter to continue...")
+                else:
+                    print(f"Transaction #{num} not found in current batch.")
+            except ValueError:
+                print("Invalid format. Use 'd<number>' (e.g., 'd5')")
+            continue
+        
+        if user_input.startswith('s'):
+            # Skip transaction
+            try:
+                num = int(user_input[1:])
+                print(f"Transaction #{num} skipped (left unreconciled).")
+                # Just continue - don't remove from list so user can come back to it
+            except ValueError:
+                print("Invalid format. Use 's<number>' (e.g., 's5')")
+            continue
+        
+        # Regular number - mark as reconciled
+        try:
+            num = int(user_input)
+            # Find transaction by number
+            found = None
+            for n, tx, prop in numbered_txs:
+                if n == num:
+                    found = (tx, prop)
+                    break
+            
+            if found:
+                tx, prop_name = found
+                
+                # Show transaction details
+                print("\n" + "=" * 80)
+                print("MARKING TRANSACTION AS RECONCILED")
+                print("=" * 80)
+                print(f"Date: {tx.date}")
+                print(f"Amount: ${tx.amount:,.2f}")
+                print(f"Name: {tx.name}")
+                print(f"Category: {tx.category}/{tx.sub_category}")
+                print(f"Property: {prop_name}")
+                print("=" * 80)
+                
+                # Get reconciliation reason
+                print("\nWhy is this transaction reconciled?")
+                print("(e.g., 'One-time expense', 'No reconciliation source', 'Verified manually', 'Insurance payment')")
+                reason = input("Reason: ").strip()
+                
+                if not reason:
+                    print("No reason provided. Transaction not marked as reconciled.")
+                    continue
+                
+                # Create match record
+                match = ReconciliationMatch(
+                    stessa_id=tx.id,
+                    match_score=1.0,
+                    match_type='manual_reconciled',
+                    notes=f"Manually reconciled: {reason}"
+                )
+                session.add(match)
+                session.commit()
+                
+                print(f"\n✓ Transaction #{num} marked as reconciled: {reason}")
+                
+                # Remove from list
+                numbered_txs = [(n, t, p) for n, t, p in numbered_txs if n != num]
+                # Renumber remaining transactions
+                numbered_txs = [(i+1, tx, prop) for i, (_, tx, prop) in enumerate(numbered_txs)]
+                
+                # Adjust start_idx if needed
+                if start_idx >= len(numbered_txs):
+                    start_idx = max(0, len(numbered_txs) - batch_size)
+            else:
+                print(f"Transaction #{num} not found in current batch.")
+        except ValueError:
+            print("Invalid input. Enter a number, 'd<number>', 's<number>', 'n', 'p', or 'q'")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Reconcile mortgage, Stessa, and Property Boss transactions')
     parser.add_argument('--year', type=int, default=2025, 
                         help='Calendar year to reconcile (default: 2025). Use --year 0 to reconcile all years.')
+    parser.add_argument('--interactive', action='store_true',
+                        help='Enter interactive mode for manually marking transactions as reconciled')
+    parser.add_argument('--clear-manual', action='store_true',
+                        help='Clear manually reconciled transactions before running reconciliation')
     args = parser.parse_args()
     
     # Convert 0 to None for "all years"
     year = args.year if args.year != 0 else None
     
-    run_reconciliation(year=year)
+    if args.interactive:
+        interactive_reconciliation_mode(year=year)
+    else:
+        run_reconciliation(year=year, clear_manual=args.clear_manual)

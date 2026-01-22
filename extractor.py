@@ -182,6 +182,174 @@ class PNCExtractor(BaseExtractor):
         
         return self.validate_data(data)
 
+class MikeMikesExtractor(BaseExtractor):
+    """Extractor for Mike & Mikes property management statements."""
+    
+    def extract(self):
+        text = self.all_text
+        
+        data = {
+            "document_type": "Property Management Statement",
+            "property_manager": "Mike & Mikes"
+        }
+        
+        # Extract statement period (format: "12-01-2025 to 12-31-2025")
+        period_match = re.search(r'(\d{2}-\d{2}-\d{4})\s+to\s+(\d{2}-\d{2}-\d{4})', text)
+        if period_match:
+            data["statement_start"] = period_match.group(1)
+            data["statement_end"] = period_match.group(2)
+        
+        # Extract statement date (format: "01-16-2026")
+        date_match = re.search(r'Statement Date\s*(\d{2}-\d{2}-\d{4})', text)
+        if date_match:
+            data["statement_date"] = date_match.group(1)
+        
+        # Extract property address
+        address_match = re.search(r'(\d+\s+N\s+\d+\w*\s+St[^,]*,\s+Milwaukee[^)]*)', text)
+        if address_match:
+            data["property_address"] = address_match.group(1).strip()
+        
+        # Extract transactions from TRANSACTION DETAILS section
+        transactions = []
+        if 'TRANSACTION DETAILS' in text:
+            details_start = text.find('TRANSACTION DETAILS')
+            details_end = text.find('OPEN WORK ORDERS', details_start)
+            if details_end == -1:
+                details_end = text.find('COMPLETED WORK ORDERS', details_start)
+            if details_end == -1:
+                details_end = details_start + 3000
+            
+            details_section = text[details_start:details_end]
+            
+            # Parse transaction lines
+            lines = details_section.split('\n')
+            current_date = None
+            
+            # Use statement start date as default if available
+            default_date = None
+            if data.get('statement_start'):
+                # Convert statement_start from MM-DD-YYYY to MM-DD-YYYY format (already in correct format)
+                default_date = data.get('statement_start')
+            
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Skip headers
+                if 'TRANSACTION DETAILS' in line or 'Description' in line or 'Date' in line:
+                    continue
+                
+                # Extract beginning/ending balance
+                if 'Beginning Balance' in line:
+                    bal_match = re.search(r'\$([\d,]+\.\d{2})', line)
+                    if bal_match:
+                        data["beginning_balance"] = self.clean_currency(bal_match.group(1))
+                    continue
+                
+                if 'Ending Balance' in line:
+                    bal_match = re.search(r'\$([\d,]+\.\d{2})', line)
+                    if bal_match:
+                        data["ending_balance"] = self.clean_currency(bal_match.group(1))
+                    continue
+                
+                # Skip property address lines and reserve info
+                if 'Reserve:' in line or 'N 36th St' in line or 'Milwaukee' in line:
+                    continue
+                
+                # Skip summary lines
+                if 'Net $' in line or 'Statement Net' in line:
+                    continue
+                
+                # Check if line contains a date (MM-DD-YYYY format)
+                date_match = re.search(r'(\d{2}-\d{2}-\d{4})', line)
+                if date_match:
+                    current_date = date_match.group(1)
+                
+                # Look for transaction descriptions with amounts
+                # Pattern: Description followed by date and amounts
+                # Try to find lines with transaction descriptions
+                # Use current_date if set, otherwise try default_date for transactions with amounts but no date
+                date_to_use = current_date
+                if not date_to_use:
+                    # Check if this line has amounts - if so, use default_date
+                    amounts_check = re.findall(r'\$([\d,]+\.\d{2})', line)
+                    if amounts_check and default_date:
+                        date_to_use = default_date
+                
+                if date_to_use:
+                    # Look for lines that have a description and amounts
+                    # Check if this line or next line has amounts
+                    amounts = re.findall(r'\$([\d,]+\.\d{2})', line)
+                    
+                    if amounts:
+                        # Extract description (everything before the first $)
+                        desc_part = line.split('$')[0].strip()
+                        
+                        # Skip if it's just a date or balance
+                        if not desc_part or desc_part == current_date or 'Balance' in desc_part:
+                            continue
+                        
+                        # Check if description is on previous line
+                        if i > 0 and not amounts and len(lines[i-1].strip()) > 0:
+                            prev_line = lines[i-1].strip()
+                            if not re.search(r'\$', prev_line) and not re.search(r'\d{2}-\d{2}-\d{4}', prev_line):
+                                desc_part = prev_line
+                        
+                        # Determine transaction type and amount
+                        description = desc_part
+                        
+                        # Check if we have both increase and decrease columns
+                        # Look at the structure: Description | Date | Increase | Decrease | Balance
+                        # If we have multiple amounts, first non-zero is likely the transaction amount
+                        transaction_amount = None
+                        is_income = False
+                        
+                        # Check description for income indicators
+                        if any(x in description.lower() for x in ['rent', 'income', 'late fee', 'utility charge']):
+                            is_income = True
+                            # Find the first non-zero amount (should be increase)
+                            for amt in amounts:
+                                if amt != '0.00':
+                                    transaction_amount = float(self.clean_currency(amt))
+                                    break
+                        else:
+                            # Expense - find decrease amount
+                            # Usually the second amount if there are two, or the amount if there's one
+                            if len(amounts) >= 2:
+                                # Second amount is usually decrease
+                                if amounts[1] != '0.00':
+                                    transaction_amount = -float(self.clean_currency(amounts[1]))
+                            elif len(amounts) == 1:
+                                if amounts[0] != '0.00':
+                                    transaction_amount = -float(self.clean_currency(amounts[0]))
+                        
+                        if transaction_amount and transaction_amount != 0:
+                            # Skip summary lines
+                            if description.lower() in ['net', 'statement net', 'ending balance', 'beginning balance']:
+                                continue
+                            
+                            # Convert date from MM-DD-YYYY to YYYY-MM-DD
+                            date_parts = date_to_use.split('-')
+                            if len(date_parts) == 3:
+                                formatted_date = f"{date_parts[2]}-{date_parts[0]}-{date_parts[1]}"
+                            else:
+                                formatted_date = date_to_use
+                            
+                            # Clean up description (remove extra whitespace and date if it's in there)
+                            description = re.sub(r'\s+', ' ', description).strip()
+                            description = re.sub(r'\d{2}-\d{2}-\d{4}', '', description).strip()
+                            
+                            transactions.append({
+                                "description": description,
+                                "date": formatted_date,
+                                "amount": transaction_amount,
+                                "is_income": is_income
+                            })
+        
+        data["transactions"] = transactions
+        return data
+
 def extract_mortgage_data(pdf_path):
     try:
         reader = PdfReader(pdf_path)
